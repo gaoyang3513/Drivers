@@ -42,6 +42,7 @@ int main (int argc, char **argv)
         }
 
         write(fd, &val, 4);
+        close(fd);
 
     return 0;
 }

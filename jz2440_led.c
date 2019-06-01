@@ -2,64 +2,75 @@
 #include <linux/module.h>
 #include <linux/fs.h>
 #include <linux/init.h>
-#include <linux/io.h>     // ioremap
-#include <asm/uaccess.h>  // copy_from_user
+#include <linux/kdev_t.h>
+#include <linux/cdev.h>         // cdev
+#include <linux/io.h>           // ioremap
+#include <asm/uaccess.h>        // copy_from_user
+#include "jz2440_led.h"
 
-/* ¼ÓÔØÄ£Ê½ºó£¬Ö´ĞĞ"cat /proc/devices"ÃüÁî¿´µ½µÄÉè±¸Ãû³Æ */
-#define DEVICE_NAME     "leds"
+static dev_t gDev = 0;
 
-/* ¸ßµçÆ½Ãğ */
-#define LED_ON    0
-#define LED_OFF   1
+struct led_dev Leds_tab[LEDS_DEV_CNT] = {
+    {.off = 4, .phyAddr_Con = S3C2410_GPFCON, .phyAddr_Dat = S3C2410_GPFDAT},
+    {.off = 5, .phyAddr_Con = S3C2410_GPFCON, .phyAddr_Dat = S3C2410_GPFDAT},
+    {.off = 6, .phyAddr_Con = S3C2410_GPFCON, .phyAddr_Dat = S3C2410_GPFDAT},
+};
 
-/* ÓÃÀ´Ö¸¶¨LEDËùÓÃµÄGPIOÒı½Å */
-#define S3C2410_GPACON      0x56000000
-#define S3C2410_GPFCON      (S3C2410_GPACON + 0x50)
-#define S3C2410_GPFDAT      (S3C2410_GPACON + 0x54)
+static int set_led (led_dev_t *led, enum led_sta sta)
+{
+        unsigned int val, off;
+        unsigned long *pGpio_Con;
+        unsigned long *pGpio_Dat;
 
-#define S3C2410_GPF4_SHT    4
-#define S3C2410_GPF5_SHT    5
-#define S3C2410_GPF6_SHT    6
+        off       = led->off;
+        pGpio_Con = led->pGpioCon;
+        pGpio_Dat = led->pGpioDat;
 
-/* ÓÃÀ´Ö¸¶¨GPIOÒı½ÅµÄ¹¦ÄÜ£ºÊä³ö */
-#define S3C2410_GPF4_OUTP   (0x01 << (2*S3C2410_GPF4_SHT))
-#define S3C2410_GPF5_OUTP   (0x01 << (2*S3C2410_GPF5_SHT))
-#define S3C2410_GPF6_OUTP   (0x01 << (2*S3C2410_GPF6_SHT))
+        val = readl(pGpio_Con);
+        val |= (1 << (2 * off));
+        writel(val, pGpio_Con);
 
-static int gMajor = 0;
-static volatile unsigned long *gpGpioF_Con = 0;
-static volatile unsigned long *gpGpioF_Dat = 0;
+        val = readl(pGpio_Dat);
+        val &= ~(1 << off);             
+        val |= sta << off;
+        writel(val, pGpio_Dat);
+        printk("Set led%d %s\n", off, sta ? "off" : "on");
+
+        return 0;
+}
 
 static int s3c24xx_led_open(struct inode *inode , struct file *file)
 {
-    printk("Open leds succeed.\n");
+        unsigned int minor;
 
-    return 0;
+        minor = MINOR(inode->i_rdev);
+        file->private_data = (void *)&Leds_tab[minor];
+
+        printk("Open leds succeed.\n");
+
+        return 0;
 }
 
 static ssize_t s3c24xx_led_write (struct file *file, const char __user *buf, size_t count, loff_t *ppos)
 {
         char val;
-        
+        struct led_dev *led;
+
+        led = (struct led_dev* )file->private_data;
+   
         if (copy_from_user(&val, buf, 1)) {
                 printk("Error: an error occurred when run  copy_from_user.\n");
+   
                 return -1;
         }
+
         switch (val) {
-        case 1:
-                val = readl(gpGpioF_Dat);
-                val &= ~(0x01 << S3C2410_GPF4_SHT);                
-                val |= LED_ON << S3C2410_GPF4_SHT;
-                writel(val, gpGpioF_Dat);
-                printk("Set led0 on\n");
+        case 0:
+                set_led(led, LED_OFF);
 
                 break;
-        case 0:
-                val = readl(gpGpioF_Dat);
-                val &= ~(0x1 << S3C2410_GPF4_SHT);
-                val |= LED_OFF << S3C2410_GPF4_SHT;
-                writel(val, gpGpioF_Dat);
-                printk("Set led0 off\n");
+        case 1:
+                set_led(led, LED_ON);
 
                 break;
         default :
@@ -78,46 +89,65 @@ struct file_operations s3c24xx_led_fops = {
 
 static int __init jz24xx_led_init(void)
 {
-        volatile unsigned val_con, val_dat;
+        int i, Ret = 0;
 
-        /* GPACON 0x56000000 ~ MSLCON 0x560000CC */
-        gpGpioF_Con = (unsigned long *)ioremap(S3C2410_GPFCON, 4);
-        gpGpioF_Dat = gpGpioF_Con + 1;
-
-        printk("ioremap succeed. gpGpioF_Con=0x%p, gpGpioF_Dat=0x%p\n", gpGpioF_Con, gpGpioF_Dat);
-        
-        gMajor = register_chrdev(0, DEVICE_NAME, &s3c24xx_led_fops);
-        if (gMajor < 0) {
+        Ret = alloc_chrdev_region(&gDev, LEDS_DEV_MINOR, LEDS_DEV_CNT, DEVICE_NAME);
+        if (Ret) {
                 printk("[%s]: Register chrdev LED failed.\n", DEVICE_NAME);
                 return -1;
         }
-        printk("register_chrdev\n");
-        
-        val_con = readl(gpGpioF_Con);
-        val_con |= S3C2410_GPF4_OUTP | S3C2410_GPF5_OUTP | S3C2410_GPF6_OUTP;
-        writel(val_con, gpGpioF_Con);
 
-        val_dat = readl(gpGpioF_Dat);
-        val_dat |= ((0x01 << S3C2410_GPF4_SHT) | (0x01 << S3C2410_GPF5_SHT) | (0x01 << S3C2410_GPF6_SHT));
-        writel(val_dat, gpGpioF_Dat);
+        printk("Register chrdev LED success, with Numer=(%3d, %3d).\n", MAJOR(gDev), MINOR(gDev));
+
+        for (i = 0; i < LEDS_DEV_CNT; i++) {
+                /* cdev_initåˆå§‹åŒ–cdevå…¶ä¸­æœ€é‡è¦çš„->opsã€->kobj */
+                cdev_init(&Leds_tab[i].dev, &s3c24xx_led_fops);
+                Leds_tab[i].dev.owner = THIS_MODULE;
+                /* 
+                 * cdev_addå°†cdevæŠ½è±¡ä¸ºprobeæ¢é’ˆå¹¶ä¿å­˜åˆ°å…¨å±€å˜é‡cdev_mapï¼Œ
+                 * cdev_mapæ˜¯ä½¿ç”¨ä¸»è®¾å¤‡å·Majorä¸ºç´¢å¼•çš„æ•°ç»„ï¼Œå…±æœ‰255ä¸ªå…ƒç´ ï¼Œæ¯ä¸ªå…ƒç´ ä¸ºä¸€ä¸ªprobeé“¾è¡¨
+                 */
+                cdev_add(&Leds_tab[i].dev, gDev + i, 1);
+        }
+
+        printk("Leds regitster succeed.\n");
+
+        for (i = 0; i < LEDS_DEV_CNT; i++) {
+                Leds_tab[i].pGpioCon = (unsigned long *)ioremap(Leds_tab[i].phyAddr_Con, 4);
+                Leds_tab[i].pGpioDat = (unsigned long *)ioremap(Leds_tab[i].phyAddr_Dat, 4);
+
+                printk("IOremap succeed,LED_%d, gpGpioF_Con=0x%p, gpGpioF_Dat=0x%p\n",
+                       i, Leds_tab[i].pGpioCon, Leds_tab[i].pGpioDat);
+
+                set_led(&Leds_tab[i], LED_ON);
+        }
+
         printk("Leds init succeed.\n");
-
         printk("[%s]: Module init success.\n", DEVICE_NAME);
         return 0;
 }
 
 static void __exit jz24xx_led_exit(void)
 {
-    int ret = 0;
+        int i;
 
-    iounmap(gpGpioF_Con);
+        for (i = 0; i < LEDS_DEV_CNT; i++) {
+                set_led(&Leds_tab[i], LED_OFF);
 
-    ret = unregister_chrdev(gMajor, DEVICE_NAME);
-    if ( ret < 0) {
-        printk("[%s]: Unregister chrdev failed.", DEVICE_NAME);
-    }
+                iounmap(Leds_tab[i].pGpioCon);
+                iounmap(Leds_tab[i].pGpioDat);
 
-    printk("[%s]: Module exit success.\n", DEVICE_NAME);
+                printk("IOunmap succeed, LED_%d, gpGpioF_Con=0x%p, gpGpioF_Dat=0x%p\n",
+                       i, Leds_tab[i].pGpioCon, Leds_tab[i].pGpioDat);
+        }
+
+        printk("Leds deinit succeed.\n");
+
+        for (i = 0; i < LEDS_DEV_CNT; i++)
+                cdev_del(&Leds_tab[i].dev);
+        unregister_chrdev_region(gDev, LEDS_DEV_CNT);
+
+        printk("[%s]: Module exit success.\n", DEVICE_NAME);
 }
 
 module_init(jz24xx_led_init);
